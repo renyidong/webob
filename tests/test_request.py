@@ -3519,6 +3519,31 @@ class TestRequestMultipart(unittest.TestCase):
         self.assertEqual(req.POST['title'].encode('utf8'),
                          text_('こんにちは', 'utf-8').encode('utf8'))
 
+
+class Test_encode_multipart(unittest.TestCase):
+    def _callFUT(self, vars, content_type):
+        from webob.request import _encode_multipart
+        return _encode_multipart(vars, content_type)
+
+    def test_with_type_options(self):
+        from webob.request import cgi_FieldStorage
+        from webob.request import BaseRequest
+        from io import BytesIO
+
+        fs = cgi_FieldStorage()
+        fs.name = 'test'
+        fs.filename = 'test.txt'
+        fs.type = 'text/html'
+        fs.type_options['charset'] = 'utf-8'
+        fs.file = BytesIO(b'test')
+
+        vars = {}
+        vars['test'] = fs
+        fake_multipart = self._callFUT(vars.items(), 'multipart/form-data')
+        print(vars)
+        print(fake_multipart)
+
+
 def simpleapp(environ, start_response):
     from webob.request import Request
     status = '200 OK'
