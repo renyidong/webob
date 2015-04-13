@@ -512,6 +512,21 @@ class TestRequestCommon(unittest.TestCase):
         result = req.POST
         self.assertEqual(result['var1'], 'value1')
 
+    def test_POST_json_no_content_type(self):
+        data = b'{"password": "last centurion", "email": "rory@wiggy.net"}'
+        INPUT = BytesIO(data)
+        environ = {'wsgi.input': INPUT,
+                   'REQUEST_METHOD': 'POST',
+                   'CONTENT_LENGTH':len(data),
+                   'webob.is_body_seekable': True,
+                  }
+        req = self._makeOne(environ)
+        r_1 = req.body
+        r_2 = req.POST
+        r_3 = req.body
+        self.assertEqual(r_1, b'{"password": "last centurion", "email": "rory@wiggy.net"}')
+        self.assertEqual(r_3, b'{"password": "last centurion", "email": "rory@wiggy.net"}')
+
     def test_PUT_bad_content_type(self):
         from webob.multidict import NoVars
         data = b'input'
@@ -2980,14 +2995,10 @@ class TestRequest_functional(unittest.TestCase):
             content_type='multipart/form-data; boundary=boundary',
             POST=_cgi_escaping_body
         )
-        f0 = req.body_file_raw
         post1 = req.POST
-        f1 = req.body_file_raw
-        self.assertTrue(f1 is not f0)
+        self.assertTrue('webob._parsed_post_vars' in req.environ)
         post2 = req.POST
-        f2 = req.body_file_raw
         self.assertTrue(post1 is post2)
-        self.assertTrue(f1 is f2)
 
 
     def test_middleware_body(self):
@@ -3307,90 +3318,6 @@ class TestRequest_functional(unittest.TestCase):
         req2_body = req2.body
         self.assertEqual(req_body, req2_body)
 
-class FakeCGIBodyTests(unittest.TestCase):
-    def test_encode_multipart_value_type_options(self):
-        from cgi import FieldStorage
-        from webob.request import BaseRequest, FakeCGIBody
-        from webob.multidict import MultiDict
-        multipart_type = 'multipart/form-data; boundary=foobar'
-        from io import BytesIO
-        body = (
-            b'--foobar\r\n'
-            b'Content-Disposition: form-data; name="bananas"; '
-                    b'filename="bananas.txt"\r\n'
-            b'Content-type: text/plain; charset="utf-7"\r\n'
-            b'\r\n'
-            b"these are the contents of the file 'bananas.txt'\r\n"
-            b'\r\n'
-            b'--foobar--')
-        multipart_body = BytesIO(body)
-        environ = BaseRequest.blank('/').environ
-        environ.update(CONTENT_TYPE=multipart_type)
-        environ.update(REQUEST_METHOD='POST')
-        environ.update(CONTENT_LENGTH=len(body))
-        fs = FieldStorage(multipart_body, environ=environ)
-        vars = MultiDict.from_fieldstorage(fs)
-        self.assertEqual(vars['bananas'].__class__, FieldStorage)
-        fake_body = FakeCGIBody(vars, multipart_type)
-        self.assertEqual(fake_body.read(), body)
-
-    def test_encode_multipart_no_boundary(self):
-        from webob.request import FakeCGIBody
-        self.assertRaises(ValueError, FakeCGIBody, {}, 'multipart/form-data')
-
-    def test_repr(self):
-        from webob.request import FakeCGIBody
-        body = FakeCGIBody({'bananas': 'bananas'},
-                           'multipart/form-data; boundary=foobar')
-        body.read(1)
-        import re
-        self.assertEqual(
-            re.sub(r'\b0x[0-9a-f]+\b', '<whereitsat>', repr(body)),
-            "<FakeCGIBody at <whereitsat> viewing {'bananas': 'ba...nas'}>",
-        )
-
-    def test_fileno(self):
-        from webob.request import FakeCGIBody
-        body = FakeCGIBody({'bananas': 'bananas'},
-                           'multipart/form-data; boundary=foobar')
-        self.assertEqual(body.fileno(), None)
-
-    def test_iter(self):
-        from webob.request import FakeCGIBody
-        body = FakeCGIBody({'bananas': 'bananas'},
-                           'multipart/form-data; boundary=foobar')
-        self.assertEqual(list(body), [
-            b'--foobar\r\n',
-            b'Content-Disposition: form-data; name="bananas"\r\n',
-            b'\r\n',
-            b'bananas\r\n',
-            b'--foobar--',
-         ])
-
-    def test_readline(self):
-        from webob.request import FakeCGIBody
-        body = FakeCGIBody({'bananas': 'bananas'},
-                           'multipart/form-data; boundary=foobar')
-        self.assertEqual(body.readline(), b'--foobar\r\n')
-        self.assertEqual(
-            body.readline(),
-            b'Content-Disposition: form-data; name="bananas"\r\n')
-        self.assertEqual(body.readline(), b'\r\n')
-        self.assertEqual(body.readline(), b'bananas\r\n')
-        self.assertEqual(body.readline(), b'--foobar--')
-        # subsequent calls to readline will return ''
-
-    def test_read_bad_content_type(self):
-        from webob.request import FakeCGIBody
-        body = FakeCGIBody({'bananas': 'bananas'}, 'application/jibberjabber')
-        self.assertRaises(AssertionError, body.read)
-
-    def test_read_urlencoded(self):
-        from webob.request import FakeCGIBody
-        body = FakeCGIBody({'bananas': 'bananas'},
-                           'application/x-www-form-urlencoded')
-        self.assertEqual(body.read(), b'bananas=bananas')
-
 
 class Test_cgi_FieldStorage__repr__patch(unittest.TestCase):
     def _callFUT(self, fake):
@@ -3507,6 +3434,31 @@ class TestRequestMultipart(unittest.TestCase):
         req = Request.from_bytes(_test_req_multipart_charset)
         self.assertEqual(req.POST['title'].encode('utf8'),
                          text_('こんにちは', 'utf-8').encode('utf8'))
+
+
+class Test_encode_multipart(unittest.TestCase):
+    def _callFUT(self, vars, content_type):
+        from webob.request import _encode_multipart
+        return _encode_multipart(vars, content_type)
+
+    def test_with_type_options(self):
+        from webob.request import cgi_FieldStorage
+        from webob.request import BaseRequest
+        from io import BytesIO
+
+        fs = cgi_FieldStorage()
+        fs.name = 'test'
+        fs.filename = 'test.txt'
+        fs.type = 'text/html'
+        fs.type_options['charset'] = 'utf-8'
+        fs.file = BytesIO(b'test')
+
+        vars = {}
+        vars['test'] = fs
+        fake_multipart = self._callFUT(vars.items(), 'multipart/form-data')
+        print(vars)
+        print(fake_multipart)
+
 
 def simpleapp(environ, start_response):
     from webob.request import Request

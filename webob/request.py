@@ -785,8 +785,10 @@ class BaseRequest(object):
             return NoVars('Not an HTML form submission (Content-Type: %s)'
                           % content_type)
         self._check_charset()
-        if self.is_body_seekable:
-            self.body_file_raw.seek(0)
+
+        self.make_body_seekable()
+        self.body_file_raw.seek(0)
+
         fs_environ = env.copy()
         # FieldStorage assumes a missing CONTENT_LENGTH, but a
         # default of 0 is better:
@@ -806,11 +808,6 @@ class BaseRequest(object):
                 keep_blank_values=True)
             vars = MultiDict.from_fieldstorage(fs)
 
-
-        #ctype = self.content_type or 'application/x-www-form-urlencoded'
-        ctype = self._content_type_raw or 'application/x-www-form-urlencoded'
-        f = FakeCGIBody(vars, ctype)
-        self.body_file = io.BufferedReader(f)
         env['webob._parsed_post_vars'] = (vars, self.body_file_raw)
         return vars
 
@@ -1567,51 +1564,6 @@ def _cgi_FieldStorage__repr__patch(self):
     return "FieldStorage(%r, %r, %r)" % (self.name, self.filename, self.value)
 
 cgi_FieldStorage.__repr__ = _cgi_FieldStorage__repr__patch
-
-class FakeCGIBody(io.RawIOBase):
-    def __init__(self, vars, content_type):
-        if content_type.startswith('multipart/form-data'):
-            if not _get_multipart_boundary(content_type):
-                raise ValueError('Content-type: %r does not contain boundary'
-                            % content_type)
-        self.vars = vars
-        self.content_type = content_type
-        self.file = None
-
-    def __repr__(self):
-        inner = repr(self.vars)
-        if len(inner) > 20:
-            inner = inner[:15] + '...' + inner[-5:]
-        return '<%s at 0x%x viewing %s>' % (
-            self.__class__.__name__,
-            abs(id(self)), inner)
-
-    def fileno(self):
-        return None
-
-    @staticmethod
-    def readable():
-        return True
-
-    def readinto(self, buff):
-        if self.file is None:
-            if self.content_type.startswith(
-                'application/x-www-form-urlencoded'):
-                data = '&'.join(
-                    '%s=%s' % (quote_plus(bytes_(k, 'utf8')), quote_plus(bytes_(v, 'utf8')))
-                    for k,v in self.vars.items()
-                )
-                self.file = io.BytesIO(bytes_(data))
-            elif self.content_type.startswith('multipart/form-data'):
-                self.file = _encode_multipart(
-                    self.vars.items(),
-                    self.content_type,
-                    fout=io.BytesIO()
-                )[1]
-                self.file.seek(0)
-            else:
-                assert 0, ('Bad content type: %r' % self.content_type)
-        return self.file.readinto(buff)
 
 
 def _get_multipart_boundary(ctype):
