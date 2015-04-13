@@ -1,13 +1,13 @@
 from setuptools import setup
 
-version = '1.5.0dev0'
+version = '0.0.0.dev0'
 
 testing_extras = ['nose', 'coverage']
 
 docs_extras = ['Sphinx']
 
 setup(
-    name='WebOb',
+    name='WebOb-ng',
     version=version,
     description="WSGI request and response object",
     long_description="""\
