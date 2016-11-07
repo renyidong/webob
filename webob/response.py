@@ -12,6 +12,8 @@ try:
 except ImportError:
     import json
 
+import warnings
+
 from webob.byterange import ContentRange
 
 from webob.cachecontrol import (
@@ -68,15 +70,107 @@ _OK_PARAM_RE = re.compile(r'^[a-z0-9_.-]+$', re.I)
 
 _gzip_header = b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff'
 
+_marker = object()
+
 class Response(object):
     """
-        Represents a WSGI response
+        Represents a WSGI response.
+
+        If no arguments are passed, creates a :class:`~Response` that uses a
+        variety of defaults. The defaults may be changed by sub-classing the
+        :class:`~Response`. See the :ref:`sub-classing notes
+        <response_subclassing_notes>`.
+
+        :cvar ~Response.body: If ``body`` is a ``text_type``, then it will be
+            encoded using either ``charset`` when provided or
+            ``default_encoding`` when ``charset`` is not provided. This
+            argument is mutually  exclusive with ``app_iter``.
+
+        :vartype ~Response.body: bytes or text_type
+
+        :cvar ~Response.status: Either an :class:`int` or a string that is
+            an integer followed by the status text. If it is an integer, it
+            will be converted to a proper status that also includes the status
+            text.  Any existing status text will be kept. Non-standard values
+            are allowed.
+
+        :vartype ~Response.status: int or str
+
+        :cvar list ~Response.headerlist: A list of HTTP headers for the response.
+
+        :cvar ~Response.app_iter: An iterator that is used as the body of the
+            response. Should conform to the WSGI requirements and should
+            provide bytes. This argument is mutually exclusive with ``body``.
+
+        :vartype ~Response.app_iter: iterable
+
+        :cvar ~Response.content_type: Sets the ``Content-Type`` header. If the
+            ``headerlist`` already contains a ``Content-Type``, then it will
+            take precedence. If no ``Content-Type`` is set in the
+            ``headerlist``, then the ``default_content_type`` value will be
+            used instead.
+
+        :vartype ~Response.content_type: str or None
+
+        :cvar conditional_response: Used to change the behavior of the
+            :class:`~Response` to check the original request for conditional
+            response headers. See :meth:`~Response.conditional_response_app`
+            for more information.
+
+        :vartype conditional_response: bool
+
+        :cvar ~Response.charset: Adds a ``charset`` ``Content-Type`` parameter. If no
+            ``charset`` is provided and the ``Content-Type`` is text, then the
+            ``default_charset`` will automatically be added.  Currently the
+            only ``Content-Type``'s that allow for a ``charset`` are defined to
+            be ``text/*``, ``application/xml``, and ``*/*+xml``. Any other
+            ``Content-Type``'s will not have a ``charset`` added.
+
+        :vartype ~Response.charset: str or None
+
+        All other response attributes may be set on the response by providing
+        them as keyword arguments. A :exc:`TypeError` will be raised for any
+        unexpected keywords.
+
+        .. _response_subclassing_notes:
+
+        **Sub-classing notes:**
+
+        * The ``default_content_type`` is used as the default for the
+          ``Content-Type`` header that is returned on the response. It is
+          ``text/html``.
+
+        * The ``default_charset`` is used as the default character set to
+          return on the ``Content-Type`` header, if the ``Content-Type`` allows
+          for a ``charset`` parameter. Currently the only ``Content-Type``'s
+          that allow for a ``charset`` are defined to be: ``text/*``,
+          ``application/xml``, and ``*/*+xml``. Any other ``Content-Type``'s
+          will not have a ``charset`` added.
+
+        * The ``unicode_errors`` is set to ``strict``, and access on a
+          :attr:`~Response.text` will raise an error if it fails to decode the
+          :attr:`~Response.body`.
+
+        * ``default_conditional_response`` is set to False. This flag may be
+          set to True so that all ``Response`` objects will attempt to check
+          the original request for conditional response headers. See
+          :meth:`~Response.conditional_response_app` for more information.
+
+        * ``default_body_encoding`` is set to 'UTF-8' by default, it exists to
+          allow users to get/set the Response object using .text, even if no
+          charset has been set for the Content-Type.
     """
 
     default_content_type = 'text/html'
-    default_charset = 'UTF-8' # TODO: deprecate
-    unicode_errors = 'strict' # TODO: deprecate (why would response body have errors?)
+    default_charset = 'UTF-8'
+    unicode_errors = 'strict'
     default_conditional_response = False
+    default_body_encoding = 'UTF-8'
+
+    # These two are only around so that when people pass them into the
+    # constructor they correctly get saved and set, however they are not used
+    # by any part of the Response. See commit
+    # 627593bbcd4ab52adc7ee569001cdda91c670d5d for rationale.
     request = None
     environ = None
 
@@ -85,73 +179,160 @@ class Response(object):
     #
 
     def __init__(self, body=None, status=None, headerlist=None, app_iter=None,
-                 content_type=None, conditional_response=None,
+                 content_type=None, conditional_response=None, charset=_marker,
                  **kw):
+        # Do some sanity checking, and turn json_body into an actual body
         if app_iter is None and body is None and ('json_body' in kw or 'json' in kw):
             if 'json_body' in kw:
                 json_body = kw.pop('json_body')
             else:
                 json_body = kw.pop('json')
-            body = json.dumps(json_body, separators=(',', ':'))
+            body = json.dumps(json_body, separators=(',', ':')).encode('UTF-8')
+
             if content_type is None:
                 content_type = 'application/json'
+
         if app_iter is None:
             if body is None:
                 body = b''
         elif body is not None:
             raise TypeError(
                 "You may only give one of the body and app_iter arguments")
+
+        # Set up Response.status
         if status is None:
             self._status = '200 OK'
         else:
             self.status = status
+
+        # Initialize headers
+        self._headers = None
         if headerlist is None:
             self._headerlist = []
         else:
             self._headerlist = headerlist
-        self._headers = None
-        if content_type is None:
-            content_type = self.default_content_type
-        charset = None
-        if 'charset' in kw:
-            charset = kw.pop('charset')
-        elif self.default_charset:
-            if content_type and 'charset=' not in content_type:
-                if (content_type == 'text/html'
-                        or content_type.startswith('text/')
-                        or _is_xml(content_type)
-                        or _is_json(content_type)):
-                    charset = self.default_charset
-        if content_type and charset and not _is_json(content_type):
-            content_type += '; charset=' + charset
-        elif self._headerlist and charset:
-            self.charset = charset
-        if not self._headerlist and content_type:
+
+        # Set the encoding for the Response to charset, so if a charset is
+        # passed but the Content-Type does not allow for a charset, we can
+        # still encode text_type body's.
+        # r = Response(
+        #   content_type='application/foo',
+        #   charset='UTF-8',
+        #   body=u'somebody')
+        # Should work without issues, and the header will be correctly set to
+        # Content-Type: application/foo with no charset on it.
+
+        encoding = None
+        if charset is not _marker:
+            encoding = charset
+
+        # Does the status code have a body or not?
+        code_has_body = (
+            self._status[0] != '1' and
+            self._status[:3] not in ('204', '205', '304')
+        )
+
+        # We only set the content_type to the one passed to the constructor or
+        # the default content type if there is none that exists AND there was
+        # no headerlist passed. If a headerlist was provided then most likely
+        # the ommission of the Content-Type is on purpose and we shouldn't try
+        # to be smart about it.
+        #
+        # Also allow creation of a empty Response with just the status set to a
+        # Response with empty body, such as Response(status='204 No Content')
+        # without the default content_type being set (since empty bodies have
+        # no Content-Type)
+        #
+        # Check if content_type is set because default_content_type could be
+        # None, in which case there is no content_type, and thus we don't need
+        # to anything
+
+        content_type = content_type or self.default_content_type
+
+        if headerlist is None and code_has_body and content_type:
+            # Set up the charset, if the content_type doesn't already have one
+
+            has_charset = 'charset=' in content_type
+
+            # If the Content-Type already has a charset, we don't set the user
+            # provided charset on the Content-Type, so we shouldn't use it as
+            # the encoding for text_type based body's.
+            if has_charset:
+                encoding = None
+
+            # Do not use the default_charset for the encoding because we
+            # want things like
+            # Response(content_type='image/jpeg',body=u'foo') to raise when
+            # trying to encode the body.
+
+            new_charset = encoding
+
+            if (
+                not has_charset and
+                charset is _marker and
+                self.default_charset
+            ):
+                new_charset = self.default_charset
+
+            # Optimize for the default_content_type as shipped by
+            # WebOb, becuase we know that 'text/html' has a charset,
+            # otherwise add a charset if the content_type has a charset.
+            #
+            # Even if the user supplied charset explicitly, we do not add
+            # it to the Content-Type unless it has has a charset, instead
+            # the user supplied charset is solely used for encoding the
+            # body if it is a text_type
+
+            if (
+                new_charset and
+                (
+                    content_type == 'text/html' or
+                    _content_type_has_charset(content_type)
+                )
+            ):
+                content_type += '; charset=' + new_charset
+
             self._headerlist.append(('Content-Type', content_type))
+
+        # Set up conditional response
         if conditional_response is None:
             self.conditional_response = self.default_conditional_response
         else:
             self.conditional_response = bool(conditional_response)
-        if app_iter is None:
+
+        # Set up app_iter if the HTTP Status code has a body
+        if app_iter is None and code_has_body:
             if isinstance(body, text_type):
-                if charset is None:
+                # Fall back to trying self.charset if encoding is not set. In
+                # most cases encoding will be set to the default value.
+                encoding = encoding or self.charset
+                if encoding is None:
                     raise TypeError(
                         "You cannot set the body to a text value without a "
                         "charset")
-                body = body.encode(charset)
+                body = body.encode(encoding)
             app_iter = [body]
-            if headerlist is None:
-                self._headerlist.append(('Content-Length', str(len(body))))
-            else:
-                self.headers['Content-Length'] = str(len(body))
+
+            if headerlist is not None:
+                self._headerlist[:] = [
+                    (k, v)
+                    for (k, v)
+                    in self._headerlist
+                    if k.lower() != 'content-length'
+                ]
+            self._headerlist.append(('Content-Length', str(len(body))))
+        elif app_iter is None or not code_has_body:
+            app_iter = [b'']
+
         self._app_iter = app_iter
+
+        # Loop through all the remaining keyword arguments
         for name, value in kw.items():
             if not hasattr(self.__class__, name):
                 # Not a basic attribute
                 raise TypeError(
                     "Unexpected keyword: %s=%r" % (name, value))
             setattr(self, name, value)
-
 
     @classmethod
     def from_file(cls, fp):
@@ -176,7 +357,7 @@ class Response(object):
             _http = b'HTTP/'
 
         if status.startswith(_http):
-            (http_ver, status_num, status_text) = status.split()
+            (http_ver, status_num, status_text) = status.split(None, 2)
             status = '%s %s' % (native_(status_num), native_(status_text))
 
         while 1:
@@ -213,12 +394,10 @@ class Response(object):
         # and this to make sure app_iter instances are different
         self._app_iter = list(app_iter)
         return self.__class__(
-            content_type=False,
             status=self._status,
             headerlist=self._headerlist[:],
             app_iter=app_iter,
             conditional_response=self.conditional_response)
-
 
     #
     # __repr__, __str__
@@ -256,7 +435,7 @@ class Response(object):
         else:
             self.status_code = code
             return
-        if PY3: # pragma: no cover
+        if PY3:
             if isinstance(value, bytes):
                 value = value.decode('ascii')
         elif isinstance(value, text_type):
@@ -268,7 +447,10 @@ class Response(object):
 
         # Attempt to get the status code itself, if this fails we should fail
         try:
-            status_code = int(value.split()[0])
+            # We don't need this value anywhere, we just want to validate it's
+            # an integer. So we are using the side-effect of int() raises a
+            # ValueError as a test
+            int(value.split()[0])
         except ValueError:
             raise ValueError('Invalid status code, integer required.')
         self._status = value
@@ -288,8 +470,7 @@ class Response(object):
             self._status = '%d %s' % (code, status_generic_reasons[code // 100])
 
     status_code = status_int = property(_status_code__get, _status_code__set,
-                           doc=_status_code__get.__doc__)
-
+                                        doc=_status_code__get.__doc__)
 
     #
     # headerslist, headers
@@ -320,7 +501,7 @@ class Response(object):
         The headers in a dictionary-like object
         """
         if self._headers is None:
-            self._headers = ResponseHeaders.view_list(self.headerlist)
+            self._headers = ResponseHeaders.view_list(self._headerlist)
         return self._headers
 
     def _headers__set(self, value):
@@ -331,15 +512,14 @@ class Response(object):
 
     headers = property(_headers__get, _headers__set, doc=_headers__get.__doc__)
 
-
     #
     # body
     #
 
     def _body__get(self):
         """
-        The body of the response, as a ``str``.  This will read in the
-        entire app_iter if necessary.
+        The body of the response, as a :class:`bytes`.  This will read in
+        the entire app_iter if necessary.
         """
         app_iter = self._app_iter
 #         try:
@@ -361,7 +541,7 @@ class Response(object):
         if len(body) == 0:
             # if body-length is zero, we assume it's a HEAD response and
             # leave content_length alone
-            pass # pragma: no cover (no idea why necessary, it's hit)
+            pass
         elif self.content_length is None:
             self.content_length = len(body)
         elif self.content_length != len(body):
@@ -393,18 +573,49 @@ class Response(object):
     body = property(_body__get, _body__set, _body__set)
 
     def _json_body__get(self):
-        """Access the body of the response as JSON"""
-        # Note: UTF-8 is a content-type specific default for JSON:
-        return json.loads(self.body.decode(self.charset or 'UTF-8'))
+        """
+        Set/get the body of the response as JSON
+
+        .. note::
+
+           This will automatically :meth:`~bytes.decode` the
+           :attr:`~Response.body` as ``UTF-8`` on get, and
+           :meth:`~str.encode` the :meth:`json.dumps` as ``UTF-8``
+           before assigning to :attr:`~Response.body`.
+
+        """
+        # Note: UTF-8 is a content-type specific default for JSON
+        return json.loads(self.body.decode('UTF-8'))
 
     def _json_body__set(self, value):
-        self.body = json.dumps(value, separators=(',', ':')).encode(self.charset or 'UTF-8')
+        self.body = json.dumps(value, separators=(',', ':')).encode('UTF-8')
 
     def _json_body__del(self):
         del self.body
 
     json = json_body = property(_json_body__get, _json_body__set, _json_body__del)
 
+    def _has_body__get(self):
+        """
+        Determine if the the response has a :attr:`~Response.body`. In
+        contrast to simply accessing :attr:`~Response.body` this method
+        will **not** read the underlying :attr:`~Response.app_iter`.
+        """
+
+        app_iter = self._app_iter
+
+        if isinstance(app_iter, list) and len(app_iter) == 1:
+            if app_iter[0] != b'':
+                return True
+            else:
+                return False
+
+        if app_iter is None: # pragma: no cover
+            return False
+
+        return True
+
+    has_body = property(_has_body__get)
 
     #
     # text, unicode_body, ubody
@@ -412,24 +623,30 @@ class Response(object):
 
     def _text__get(self):
         """
-        Get/set the text value of the body (using the charset of the
-        Content-Type)
+        Get/set the text value of the body using the charset of the
+        Content-Type or the default_body_encoding.
         """
-        if not self.charset:
+        if not self.charset and not self.default_body_encoding:
             raise AttributeError(
-                "You cannot access Response.text unless charset is set")
+                "You cannot access Response.text unless charset or default_body_encoding"
+                " is set"
+            )
+        decoding = self.charset or self.default_body_encoding
         body = self.body
-        return body.decode(self.charset, self.unicode_errors)
+        return body.decode(decoding, self.unicode_errors)
 
     def _text__set(self, value):
-        if not self.charset:
+        if not self.charset and not self.default_body_encoding:
             raise AttributeError(
-                "You cannot access Response.text unless charset is set")
+                "You cannot access Response.text unless charset or default_body_encoding"
+                " is set"
+            )
         if not isinstance(value, text_type):
             raise TypeError(
                 "You can only set Response.text to a unicode string "
                 "(not %s)" % type(value))
-        self.body = value.encode(self.charset)
+        encoding = self.charset or self.default_body_encoding
+        self.body = value.encode(encoding)
 
     def _text__del(self):
         del self.body
@@ -437,7 +654,7 @@ class Response(object):
     text = property(_text__get, _text__set, _text__del, doc=_text__get.__doc__)
 
     unicode_body = ubody = property(_text__get, _text__set, _text__del,
-        "Deprecated alias for .text")
+                                    "Deprecated alias for .text")
 
     #
     # body_file, write(text)
@@ -482,8 +699,6 @@ class Response(object):
         if self.content_length is not None:
             self.content_length += len(text)
 
-
-
     #
     # app_iter
     #
@@ -510,8 +725,6 @@ class Response(object):
 
     app_iter = property(_app_iter__get, _app_iter__set, _app_iter__del,
                         doc=_app_iter__get.__doc__)
-
-
 
     #
     # headers attrs
@@ -542,7 +755,8 @@ class Response(object):
     last_modified = date_header('Last-Modified', '14.29')
 
     _etag_raw = header_getter('ETag', '14.19')
-    etag = converter(_etag_raw,
+    etag = converter(
+        _etag_raw,
         parse_etag_response, serialize_etag_response,
         'Entity tag'
     )
@@ -568,14 +782,16 @@ class Response(object):
         parse_auth, serialize_auth,
     )
 
-
     #
     # charset
     #
 
     def _charset__get(self):
         """
-        Get/set the charset (in the Content-Type)
+        Get/set the charset specified in Content-Type.
+
+        There is no checking to validate that a ``content_type`` actually allows
+        for a charset parameter.
         """
         header = self.headers.get('Content-Type')
         if not header:
@@ -587,9 +803,9 @@ class Response(object):
 
     def _charset__set(self, charset):
         if charset is None:
-            del self.charset
+            self._charset__del()
             return
-        header = self.headers.pop('Content-Type', None)
+        header = self.headers.get('Content-Type', None)
         if header is None:
             raise AttributeError("You cannot set the charset when no "
                                  "content-type is defined")
@@ -612,19 +828,38 @@ class Response(object):
     charset = property(_charset__get, _charset__set, _charset__del,
                        doc=_charset__get.__doc__)
 
-
     #
     # content_type
     #
 
     def _content_type__get(self):
         """
-        Get/set the Content-Type header (or None), *without* the
-        charset or any parameters.
+        Get/set the Content-Type header. If no Content-Type header is set, this
+        will return None.
 
-        If you include parameters (or ``;`` at all) when setting the
-        content_type, any existing parameters will be deleted;
-        otherwise they will be preserved.
+        .. versionchanged:: 1.7
+
+            Setting a new Content-Type will remove charset from the
+            Content-Type parameters if the Content-Type is not ``text/*`` or XML
+            (``application/xml``, or ``*/*+xml``)
+
+            In the future all parameters will be deleted upon changing the
+            Content-Type, if you explicitly want to transfer over existing
+            parameters, you may retrieve them with ``content_type_params`` and
+            set them after setting ``content_type``.
+
+            .. code::
+
+                resp = Response()
+                params = resp.content_type_params
+                resp.content_type = 'application/something'
+                resp.content_type_params = params
+
+        .. deprecated:: 1.7
+
+            If you include parameters (or ``;`` at all) when setting the
+            content_type, any existing parameters will be deleted;
+            otherwise they will be preserved.
         """
         header = self.headers.get('Content-Type')
         if not header:
@@ -638,16 +873,34 @@ class Response(object):
         if ';' not in value:
             header = self.headers.get('Content-Type', '')
             if ';' in header:
-                params = header.split(';', 1)[1]
-                value += ';' + params
-        self.headers['Content-Type'] = value
+                warn_deprecation(
+                    'Preserving Content-Type parameters. In the '
+                    'future upon changing the Content-Type no paramaters '
+                    'will be preserved.', 1.9, 1)
+                params = self.content_type_params
+                self.headers['Content-Type'] = value
+
+                if 'charset' in params:
+                    if not _content_type_has_charset(value):
+                        warnings.warn(
+                            'Explicitly removing charset as new content_type '
+                            'does not allow charset as a parameter. If you are '
+                            'expecting a charset to be set, please add it back '
+                            'explicitly after setting the content_type.',
+                            RuntimeWarning)
+                        del params['charset']
+
+                self.content_type_params = params
+            else:
+                self.headers['Content-Type'] = value
+        else:
+            self.headers['Content-Type'] = value
 
     def _content_type__del(self):
         self.headers.pop('Content-Type', None)
 
     content_type = property(_content_type__get, _content_type__set,
                             _content_type__del, doc=_content_type__get.__doc__)
-
 
     #
     # content_type_params
@@ -657,7 +910,7 @@ class Response(object):
         """
         A dictionary of all the parameters in the content type.
 
-        (This is not a view, set to change, modifications of the dict would not
+        (This is not a view, set to change, modifications of the dict will not
         be applied otherwise)
         """
         params = self.headers.get('Content-Type', '')
@@ -671,8 +924,9 @@ class Response(object):
 
     def _content_type_params__set(self, value_dict):
         if not value_dict:
-            del self.content_type_params
+            self._content_type_params__del()
             return
+
         params = []
         for k, v in sorted(value_dict.items()):
             if not _OK_PARAM_RE.search(v):
@@ -692,9 +946,6 @@ class Response(object):
         _content_type_params__del,
         _content_type_params__get.__doc__
     )
-
-
-
 
     #
     # set_cookie, unset_cookie, delete_cookie, merge_cookies
@@ -798,9 +1049,10 @@ class Response(object):
 
         value = bytes_(value, 'utf-8')
 
-        cookie = make_cookie(name, value, max_age=max_age, path=path,
-                domain=domain, secure=secure, httponly=httponly,
-                comment=comment)
+        cookie = make_cookie(
+            name, value, max_age=max_age, path=path,
+            domain=domain, secure=secure, httponly=httponly,
+            comment=comment)
 
         self.headerlist.append(('Set-Cookie', cookie))
 
@@ -835,7 +1087,6 @@ class Response(object):
         elif strict:
             raise KeyError("No cookie has been set with the name %r" % name)
 
-
     def merge_cookies(self, resp):
         """Merge the cookies that were set on this response with the
         given `resp` object (which can be any WSGI application).
@@ -854,11 +1105,10 @@ class Response(object):
                          h[0].lower() == 'set-cookie']
             def repl_app(environ, start_response):
                 def repl_start_response(status, headers, exc_info=None):
-                    return start_response(status, headers+c_headers,
+                    return start_response(status, headers + c_headers,
                                           exc_info=exc_info)
                 return resp(environ, repl_start_response)
             return repl_app
-
 
     #
     # cache_control
@@ -915,7 +1165,6 @@ class Response(object):
         _cache_control__get, _cache_control__set,
         _cache_control__del, doc=_cache_control__get.__doc__)
 
-
     #
     # cache_expires
     #
@@ -958,8 +1207,6 @@ class Response(object):
 
     cache_expires = property(lambda self: self._cache_expires, _cache_expires)
 
-
-
     #
     # encode_content, decode_content, md5_etag
     #
@@ -970,7 +1217,7 @@ class Response(object):
         identity are supported).
         """
         assert encoding in ('identity', 'gzip'), \
-               "Unknown encoding: %r" % encoding
+            "Unknown encoding: %r" % encoding
         if encoding == 'identity':
             self.decode_content()
             return
@@ -1021,7 +1268,22 @@ class Response(object):
         if set_content_md5:
             self.content_md5 = md5_digest
 
+    @staticmethod
+    def _make_location_absolute(environ, value):
+        if SCHEME_RE.search(value):
+            return value
 
+        new_location = urlparse.urljoin(_request_uri(environ), value)
+        return new_location
+
+    def _abs_headerlist(self, environ):
+        # Build the headerlist, if we have a Location header, make it absolute
+        return [
+            (k, v) if k.lower() != 'location'
+            else (k, self._make_location_absolute(environ, v))
+            for (k, v)
+            in self._headerlist
+        ]
 
     #
     # __call__, conditional_response_app
@@ -1033,26 +1295,14 @@ class Response(object):
         """
         if self.conditional_response:
             return self.conditional_response_app(environ, start_response)
+
         headerlist = self._abs_headerlist(environ)
+
         start_response(self.status, headerlist)
         if environ['REQUEST_METHOD'] == 'HEAD':
             # Special case here...
             return EmptyResponse(self._app_iter)
         return self._app_iter
-
-    def _abs_headerlist(self, environ):
-        """Returns a headerlist, with the Location header possibly
-        made absolute given the request environ.
-        """
-        headerlist = list(self.headerlist)
-        for i, (name, value) in enumerate(headerlist):
-            if name.lower() == 'location':
-                if SCHEME_RE.search(value):
-                    break
-                new_location = urlparse.urljoin(_request_uri(environ), value)
-                headerlist[i] = (name, new_location)
-                break
-        return headerlist
 
     _safe_methods = ('GET', 'HEAD')
 
@@ -1065,7 +1315,9 @@ class Response(object):
         * Range               (406 Partial Content; only on GET, HEAD)
         """
         req = BaseRequest(environ)
+
         headerlist = self._abs_headerlist(environ)
+
         method = environ.get('REQUEST_METHOD', 'GET')
         if method in self._safe_methods:
             status304 = False
@@ -1076,11 +1328,12 @@ class Response(object):
             if status304:
                 start_response('304 Not Modified', filter_headers(headerlist))
                 return EmptyResponse(self._app_iter)
-        if (req.range and self in req.if_range
-            and self.content_range is None
-            and method in ('HEAD', 'GET')
-            and self.status_code == 200
-            and self.content_length is not None
+        if (
+            req.range and self in req.if_range and
+            self.content_range is None and
+            method in ('HEAD', 'GET') and
+            self.status_code == 200 and
+            self.content_length is not None
         ):
             content_range = req.range.content_range(self.content_length)
             if content_range is None:
@@ -1115,7 +1368,7 @@ class Response(object):
                     return app_iter
 
         start_response(self.status, headerlist)
-        if method  == 'HEAD':
+        if method == 'HEAD':
             return EmptyResponse(self._app_iter)
         return self._app_iter
 
@@ -1134,7 +1387,7 @@ def filter_headers(hlist, remove_headers=('content-length', 'content-type')):
     return [h for h in hlist if (h[0].lower() not in remove_headers)]
 
 
-def iter_file(file, block_size=1<<18): # 256Kb
+def iter_file(file, block_size=1 << 18): # 256Kb
     while True:
         data = file.read(block_size)
         if not data:
@@ -1167,6 +1420,11 @@ class ResponseBodyFile(object):
     def flush(self):
         pass
 
+    def tell(self):
+        if self.response.app_iter is None: # pragma: no cover
+            return 0
+
+        return sum([len(chunk) for chunk in self.response.app_iter])
 
 
 class AppIterRange(object):
@@ -1195,14 +1453,13 @@ class AppIterRange(object):
             elif self._pos == start:
                 return b''
             else:
-                chunk = chunk[start-self._pos:]
+                chunk = chunk[start - self._pos:]
                 if stop is not None and self._pos > stop:
-                    chunk = chunk[:stop-self._pos]
+                    chunk = chunk[:stop - self._pos]
                     assert len(chunk) == stop - start
                 return chunk
         else:
             raise StopIteration()
-
 
     def next(self):
         if self._pos < self.start:
@@ -1218,7 +1475,7 @@ class AppIterRange(object):
         if stop is None or self._pos <= stop:
             return chunk
         else:
-            return chunk[:stop-self._pos]
+            return chunk[:stop - self._pos]
 
     __next__ = next # py3
 
@@ -1248,21 +1505,30 @@ class EmptyResponse(object):
 
     __next__ = next # py3
 
-def _is_json(content_type):
-    return (content_type.startswith('application/json')
-            or (content_type.startswith('application/')
-                and content_type.endswith('+json')))
-
 def _is_xml(content_type):
-    return (content_type.startswith('application/xml')
-            or (content_type.startswith('application/')
-                and content_type.endswith('+xml')))
+    return (
+        content_type.startswith('application/xml') or
+        (
+            content_type.startswith('application/') and
+            content_type.endswith('+xml')
+        ) or
+        (
+            content_type.startswith('image/') and
+            content_type.endswith('+xml')
+        )
+    )
+
+def _content_type_has_charset(content_type):
+    return (
+        content_type.startswith('text/') or
+        _is_xml(content_type)
+    )
 
 def _request_uri(environ):
     """Like wsgiref.url.request_uri, except eliminates :80 ports
 
     Return the full request URI"""
-    url = environ['wsgi.url_scheme']+'://'
+    url = environ['wsgi.url_scheme'] + '://'
 
     if environ.get('HTTP_HOST'):
         url += environ['HTTP_HOST']
@@ -1282,7 +1548,7 @@ def _request_uri(environ):
 
     url += url_quote(script_name)
     qpath_info = url_quote(path_info)
-    if not 'SCRIPT_NAME' in environ:
+    if 'SCRIPT_NAME' not in environ:
         url += qpath_info[1:]
     else:
         url += qpath_info
